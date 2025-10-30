@@ -132,6 +132,7 @@ class InferenceEngine:
         self.model = AutoModelForCausalLM.from_pretrained(model_name)
         self.model.to(self.device)
         self.model.eval()  # Inference mode
+        self.model.half()
 
         # Set pad token (GPT-2 doesn't have one by default)
         if self.tokenizer.pad_token is None:
@@ -162,7 +163,7 @@ class InferenceEngine:
             padding=True,  # Pad to longest sequence in batch
             truncation=True,
             return_tensors="pt"
-        ).to(self.device)
+        ).to(self.device, dtype=torch.float16)
 
         # Get generation parameters (using first request's params for simplicity)
         max_new_tokens = requests[0].max_new_tokens

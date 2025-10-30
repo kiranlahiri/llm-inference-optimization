@@ -17,6 +17,7 @@ models/
 *.nsys-rep
 *.qdrep
 *.sqlite
+*.json
 profiling_results/
 
 # Logs
