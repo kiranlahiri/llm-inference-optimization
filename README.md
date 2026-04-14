@@ -1,73 +1,114 @@
 # LLM Inference Optimization
 
-Learning project to understand GPU inference optimization through building a batched inference server.
+This repository is a GPU inference learning lab built around GPT-2 on a Tesla
+T4.
 
-## Phase 1: Basic Server + Batching (Current)
+The goal is not to build a polished app or a production serving system. The
+goal is to understand inference deeply enough to read and eventually contribute
+to projects like vLLM, FlashAttention, and CUTLASS.
 
-### Setup
+The project guide lives in [CODEX.md](CODEX.md).
+
+## What This Repo Is For
+
+Each segment of the project should produce:
+
+- a working implementation
+- a measurement showing what changed
+- an explanation of why it changed
+
+The current center of gravity is:
+
+- profiling GPT-2 decode
+- understanding why decode is memory-bound
+- building a manual GPT-2 decode path
+- making KV cache behavior explicit
+- later moving into Triton and CUDA kernels
+
+The server/client scripts are still in the repo, but they are secondary. They
+are supporting scaffolding for later systems work, not the main learning path.
+
+## Current Roadmap
+
+1. Roofline analysis of Hugging Face GPT-2 decode
+2. Manual GPT-2 decode path in PyTorch
+3. Preallocated KV cache
+4. Triton fused attention kernel
+5. CUDA GEMM: naive then tiled
+6. Continuous batching and token scheduling
+
+That order is deliberate: understand the computation first, then memory traffic,
+then kernels, then serving systems.
+
+## Setup
 
 ```bash
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Running the Server
+## Main Workflow
+
+Right now, `roofline.py` is the main benchmark harness.
+
+Use it to answer questions like:
+
+- why is GPT-2 decode memory-bound?
+- how does batch size change arithmetic intensity?
+- how sensitive are results to prompt length?
+
+### Controlled baseline
+
+Use this as the canonical benchmark for before/after comparisons:
 
 ```bash
-# Start the inference server
-python server.py
+python3 roofline.py
 ```
 
-The server will:
-- Load GPT-2 model (downloads ~500MB on first run)
-- Start on http://localhost:8000
-- Automatically batch requests that arrive within 50ms
+This keeps the short fixed prompt and gives a stable, low-noise decode baseline.
 
-### Testing Batching
+### Prompt-length sweep
+
+Use this to understand how context length changes performance:
 
 ```bash
-# Terminal 1: Start server
-python server.py
-
-# Terminal 2: Run client tests
-python client.py --mode benchmark
-
-# Or test custom scenarios
-python client.py --mode concurrent --num-requests 16 --delay-ms 10
+python3 roofline.py --prompt-token-sweep 8 64 256 512 --sweep-batch-size 1
 ```
 
-### Key Concepts (Phase 1)
+### Longer-context batch comparison
 
-**Dynamic Batching:**
-- Collects requests for max 50ms or until batch size (8) is reached
-- Processes multiple requests in single GPU forward pass
-- Amortizes kernel launch overhead and memory transfer costs
+Use this when you want the main roofline analysis at a larger prompt length:
 
-**Why Batching Helps:**
-- GPT-2 is memory-bound for small batches (spending more time moving data than computing)
-- Batching increases arithmetic intensity (compute/memory ratio)
-- Better GPU utilization through parallelism
+```bash
+python3 roofline.py --prompt-tokens 256 --batch-sizes 1 4 8
+```
 
-**Trade-offs:**
-- Latency vs throughput: Individual requests wait for batches to form
-- Padding overhead: All sequences must be same length in batch
-- Memory: Larger batches need more VRAM
+## Immediate Next Milestone
 
-## Next Steps (Phase 2)
+The next real task is building a manual GPT-2 decode path without relying on
+`model.generate()` in the critical path.
 
-- Profile with PyTorch profiler and nsys
-- Identify bottlenecks (memory bandwidth, compute, attention)
-- Apply optimizations (Flash Attention, quantization, KV cache)
-- Measure improvement with hardware counters
+That work should make the following explicit:
 
-## Architecture Notes
+- token and positional embeddings
+- per-layer attention
+- KV cache writes
+- greedy next-token selection
 
-From EECS 470 perspective:
-- Think of batching like superscalar execution (ILP but for requests)
-- GPU memory hierarchy: HBM (DRAM) → L2 → L1/Shared → Registers
-- Memory-bound = spending cycles waiting for DRAM, like cache misses
-- Goal: Keep compute units fed with data (maximize occupancy)
+The first goal is correctness and legibility. Optimization comes after the
+computation is clear.
+
+## Repo Notes
+
+- [CODEX.md](CODEX.md) is the project roadmap and working guide.
+- [roofline.py](roofline.py) is the current core benchmark script.
+- [server.py](server.py), [client.py](client.py), and [benchmark.py](benchmark.py)
+  are still useful later, but they are not the main path right now.
+
+## Guiding Principle
+
+Measure everything.
+
+If a change does not come with a number and an explanation, it is not yet doing
+the job this repo exists to do.

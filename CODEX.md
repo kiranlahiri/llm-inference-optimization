@@ -297,6 +297,76 @@ Use that baseline as the reference point for every future segment.
 
 ---
 
+## Benchmark Modes
+
+`roofline.py` now supports two benchmark styles. Use both, but for different
+reasons.
+
+### 1. Controlled decode baseline
+
+Use this when the question is:
+
+- how does batch size change arithmetic intensity?
+- did my optimization improve the main decode path?
+- how do I compare before/after changes cleanly?
+
+Command:
+
+```bash
+python3 roofline.py
+```
+
+This keeps the short fixed prompt and gives a stable reference point with low
+noise. It is the right benchmark for tracking optimization work across segments.
+
+### 2. Context-length sensitivity sweep
+
+Use this when the question is:
+
+- how much do longer prompts change throughput?
+- how sensitive is the benchmark to prefill/context length?
+- is an apparent gain only true for very short prompts?
+
+Command:
+
+```bash
+python3 roofline.py --prompt-token-sweep 8 64 256 512 --sweep-batch-size 1
+```
+
+This is not a replacement for the baseline. It is a second lens that helps
+separate clean decode benchmarking from workload sensitivity.
+
+### 3. Fixed longer-context comparison
+
+Use this when you want to rerun the main roofline analysis at a specific prompt
+length across batch sizes.
+
+Command:
+
+```bash
+python3 roofline.py --prompt-tokens 256 --batch-sizes 1 4 8
+```
+
+This is useful when a future optimization should be tested under something more
+demanding than the default short prompt.
+
+### Recommendation
+
+Use the controlled baseline as the canonical benchmark in this repo.
+
+Use the prompt-length sweep when sanity-checking whether a conclusion only holds
+for very short contexts.
+
+When Segment 3 is underway, compare the manual GPT-2 path against both:
+
+- the default baseline
+- at least one longer-context run
+
+That will keep the project honest without turning every experiment into a full
+benchmark suite.
+
+---
+
 ## Weekly Operating Loop
 
 For any segment, use the same loop:
