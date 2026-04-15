@@ -1,0 +1,140 @@
+Loading model...
+Device: cuda
+GPU: Tesla T4
+
+Profiling batch size 1 (prompt_tokens=default, max_new_tokens=50)...
+
+Profiling batch size 4 (prompt_tokens=default, max_new_tokens=50)...
+
+Profiling batch size 8 (prompt_tokens=default, max_new_tokens=50)...
+
+================================================================================
+ROOFLINE ANALYSIS — GPT-2 on T4
+================================================================================
+
+T4 Hardware Limits:
+  Memory bandwidth:   320 GB/s
+  Compute (FP16 TC):  65 TFLOPS
+  Compute (FP32):     8.1 TFLOPS
+  Ridge point (FP16): 203 FLOPs/byte   ← need this AI to saturate Tensor Cores
+  Ridge point (FP32): 25.3 FLOPs/byte
+
+────────────────────────────────────────────────────────────────────────────────
+THROUGHPUT
+────────────────────────────────────────────────────────────────────────────────
+Prompt tokens: 5 | Generated tokens/request: 50
+ Batch    tokens/sec    ms/token    total_ms
+──────  ────────────  ──────────  ──────────
+     1          52.4        19.1       954.5
+     4         202.2        19.8       989.1
+     8         413.9        19.3       966.4
+
+────────────────────────────────────────────────────────────────────────────────
+LINEAR PROJECTIONS (aten::addmm) — where most GPU time goes
+────────────────────────────────────────────────────────────────────────────────
+ Batch    AI (F/B)   Achieved TF   % FP16 Peak    BW util%  Kernel type
+──────  ──────────  ────────────  ────────────  ──────────  ────────────────────
+     1        1.00        0.1526         0.235%        47.8%  GEMV (gemvx)
+     4        3.97        0.4509         0.694%        35.5%  GEMM (Tensor Core)
+     8        7.89        0.8970         1.380%        35.5%  GEMM (Tensor Core)
+
+What this means:
+  • Arithmetic intensity for linear projections scales linearly with batch size.
+    Batch=1 → ~1 F/byte. Batch=8 → ~8 F/byte. Ridge point is 203 F/byte.
+    We're 203x below the ridge at batch=1,
+    and still 26x below it at batch=8.
+  • Compute utilization is <1% even at batch=8. The Tensor Cores are almost idle.
+  • The compute throughput grows roughly linearly with batch size (good — batching works),
+    but we'd need batch ~101 to actually hit the ridge point.
+
+────────────────────────────────────────────────────────────────────────────────
+KV CACHE (aten::cat) — HuggingFace's naive implementation
+────────────────────────────────────────────────────────────────────────────────
+ Batch      cat ms    % of CUDA time  Why this is bad
+──────  ──────────  ────────────────  ────────────────────────────────────────
+     1         7.3               7.7%  allocates new tensor every token step
+     4        12.8               8.7%  allocates new tensor every token step
+     8        17.1              10.9%  allocates new tensor every token step
+
+HuggingFace's KV cache uses aten::cat to append each new K/V vector to the
+accumulated past. This allocates a brand-new tensor on every token step and
+copies the entire cache into it. For a sequence of N tokens, that's:
+  token 1:  copy 1 row
+  token 2:  copy 2 rows
+  ...
+  token 50: copy 50 rows
+  Total:    1+2+...+50 = 1275 copies = O(N²) memory traffic
+
+A proper KV cache (Phase 3) pre-allocates a fixed buffer and writes one row
+per token step — O(1) per step, O(N) total. The cat cost goes to ~zero.
+
+────────────────────────────────────────────────────────────────────────────────
+ATTENTION SCORE COMPUTATION (aten::bmm)
+────────────────────────────────────────────────────────────────────────────────
+ Batch      bmm ms    bmm MFLOPs    AI (F/B)
+──────  ──────────  ────────────  ──────────
+     1        6.53          55.1         0.5
+     4        7.51         220.4         0.5
+     8        9.39         440.9         0.5
+
+────────────────────────────────────────────────────────────────────────────────
+ROOFLINE DIAGRAM (log scale, FP16 Tensor Core roof)
+────────────────────────────────────────────────────────────────────────────────
+         TFLOPS (FP16)
+   100 |                                                            ▼         |
+       |                                                           //─────────|
+       |                                                     //////           |
+       |                                               //////                 |
+    10 |                                         //////                       |
+       |                                   //////                             |
+       |                            ///////                                   |
+       |                      //////                                          |
+     1 |                //////     ⑧                                          |
+       |          //////    ④                                                 |
+       |    //////                                                            |
+       |////  ①                                                               |
+   0.1 |                                                                      |
+       |                                                                      |
+       |                                                                      |
+       |                                                                      |
+  0.01 |                                                                      |
+       |                                                                      |
+       |                                                                      |
+ 0.001 |                                                                      |
+         +──────────────────────────────────────────────────────────────────────+
+               1                      10                     100                  FLOPs/byte
+
+  ① batch=1  ④ batch=4  ⑧ batch=8  ▼ ridge point (203 F/byte)
+────────────────────────────────────────────────────────────────────────────────
+SUMMARY
+────────────────────────────────────────────────────────────────────────────────
+
+  Batch 1 → Batch 8 throughput gain: 7.9x  (52.4 → 413.9 tokens/sec)
+
+  Why batching helps:
+    Arithmetic intensity scales with batch size (same weights, more computation).
+    At batch=1: GEMV kernels,  AI ≈ 1.0 F/byte → 48% bandwidth utilization
+    At batch=8: GEMM kernels, AI ≈ 7.9 F/byte → 36% bandwidth utilization
+    Kernel type changes at batch ≥ 4 (GEMV → Tensor Core GEMM).
+
+  What's still inefficient:
+    1. KV cache: aten::cat reallocates on every token step (O(N²) traffic)
+    2. Still far below Tensor Core peak — need batch ~101 to hit ridge point
+    3. ~17ms/82ms = 21% of linear-layer GPU time wasted on cache copies
+
+  These are exactly what Phases 3 and 4 address.
+
+
+================================================================================
+BASELINE TABLE (copy into CODEX.md)
+================================================================================
+
+| Metric                   |    Batch 1 |    Batch 4 |    Batch 8 |
+|──────────────────────────|────────────|────────────|────────────|
+| tokens/sec               |       52.4 |      202.2 |      413.9 |
+| ms/token                 |       19.1 |       19.8 |       19.3 |
+| arith. intensity (F/byte)|       1.00 |       3.97 |       7.89 |
+| achieved TFLOPS (addmm)  |     0.1526 |     0.4509 |     0.8970 |
+| % FP16 Tensor Core peak  |      0.23% |      0.69% |      1.38% |
+| bandwidth util % (addmm) |      47.8% |      35.5% |      35.5% |
+| KV cache (cat) ms        |        7.3 |       12.8 |       17.1 |
